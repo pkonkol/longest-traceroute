@@ -8,9 +8,8 @@ from pprint import pprint
 from datetime import datetime
 import sys
 
-MAX_CONCURRENT = 300
-PING_RETRIES = 50
-TRACEROUTE_TIMEOUT = 120
+MAX_CONCURRENT = 5
+TRACEROUTE_TIMEOUT = 30
 ASRANK_FILE = "asns.jsonl"
 TRACEROUTE_CMD = 'gtraceroute'
 PING_CMD = 'gping'
@@ -81,7 +80,7 @@ async def find_live_ip(prefix):
 
     # If no live IPs found yet, randomly test other IPs in the prefix
     if not live_ips:
-        random_ips = random.sample(list(net.hosts()), min(100, net.num_addresses - 2))
+        random_ips = random.sample(list(net.hosts()), min(10, net.num_addresses - 2))
         for ip in random_ips:
             if await is_pingable(str(ip)):
                 live_ips.append(str(ip))
@@ -168,18 +167,18 @@ async def run_traceroute(ip, asn_data, prefix, results, longest):
     except Exception as e:
         print(f"[ASN {asn}] Traceroute failed: {e}")
 
-
 async def handle_asn(asn_data, results, longest):
     """
     Handles scanning for a given ASN:
     1. Finds live IPs in the ASN's prefixes.
     2. Runs traceroute for each live IP.
     """
+    # print("handle asns 1")
     for prefix in asn_data['prefixes']:
-        # Get a list of live IPs (first, last, and random usable IPs if pingable)
+        # Find live IPs for the current prefix
         live_ips = await find_live_ip(prefix)
 
-        # Scan each live IP
+        # Run traceroute for each live IP
         for ip in live_ips:
             async with semaphore:  # Limit concurrency
                 await run_traceroute(ip, asn_data, prefix, results, longest)
@@ -230,7 +229,7 @@ async def main():
         print("Generating ASN-to-prefixes mapping...")
         asns = load_smallest_asns(100000)  # Generate the mapping and save it to a file
         with open(ASN_PREFIXES_FILE, "w") as f:
-            huj = json.dump(asns, f, indent=2)
+            json.dump(asns, f, indent=2)
 
     start_index = next((i for i, asn in enumerate(asns) if asn['asn'] == start_asn), None)
     if start_index is None:
@@ -246,7 +245,11 @@ async def main():
     results = []
     longest_result = {"hops": 0}
 
-    tasks = [asyncio.create_task(handle_asn(asn, results, longest_result)) for asn in asns]
+    # Create tasks for each ASN
+    print("creating tasks")
+    tasks = [handle_asn(asn_data, results, longest_result) for asn_data in asns]
+
+    # Run all tasks concurrently
     await asyncio.gather(*tasks)
 
     last_asn = asns[-1]['asn']
