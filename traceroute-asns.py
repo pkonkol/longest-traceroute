@@ -214,11 +214,12 @@ def save_results(results, longest, last_asn):
     print(f"Longest route saved to {longest_route_filename}")
 
 async def main():
-    start_asn, n = 0, 10
-    if len(sys.argv) > 2:
-        start_asn = int(sys.argv[1])  # Take the first argument as the starting ASN
-        n = int(sys.argv[2])
-        print(f"Starting from ASN: {start_asn}, number asns to scan: {n}")
+    start_asn, n = 0, 1000000
+    if len(sys.argv) > 1:
+        n = int(sys.argv[1])
+    if len(sys.argv) == 3:
+        start_asn = int(sys.argv[2])  # Take the first argument as the starting ASN
+    print(f"Starting from ASN: {start_asn}, number asns to scan: {n}")
 
     # Check if the ASN-to-prefixes mapping file exists
     if os.path.exists(ASN_PREFIXES_FILE):
@@ -234,7 +235,7 @@ async def main():
     start_index = next((i for i, asn in enumerate(asns) if asn['asn'] == start_asn), None)
     if start_index is None:
         start_index = 0
-    asns = asns[start_index:start_index + n]
+    asns = asns[max(0, start_index-1):start_index + n]
 
     # Initialize the scan using the loaded or generated mapping
     pprint(asns[:10])
