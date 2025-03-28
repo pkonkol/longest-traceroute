@@ -7,6 +7,7 @@ import os
 from pprint import pprint
 from datetime import datetime
 import sys
+import logging
 
 MAX_CONCURRENT = 5
 TRACEROUTE_TIMEOUT = 30
@@ -15,6 +16,17 @@ TRACEROUTE_CMD = 'gtraceroute'
 PING_CMD = 'gping'
 ASN_PREFIXES_FILE = "asn_prefixes.json"
 OUTPUT_DIR = "outputs"
+LOG_FILE = "traceroute.log"
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),  # Log to console (stdout)
+        logging.FileHandler(LOG_FILE, mode="a")  # Append logs to a file
+    ]
+)
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
@@ -107,7 +119,7 @@ async def is_pingable(ip):
 async def run_traceroute(ip, asn_data, prefix, results, longest):
     asn = asn_data['asn']
     try:
-        print(f"[ASN {asn}] Traceroute to {ip} started")
+        logging.info(f"[ASN {asn}] Traceroute to {ip} started")
 
         proc = await asyncio.create_subprocess_exec(
             TRACEROUTE_CMD, '-q', '1', '-w', '1', '-m', '50','-I', ip,
@@ -120,9 +132,9 @@ async def run_traceroute(ip, asn_data, prefix, results, longest):
             output = stdout.decode().splitlines()
             errout = stderr.decode()
 
-            # Print stderr for debugging (optional)
+            # Log stderr for debugging (optional)
             if len(errout) > 0:
-                pprint(f"found error: {errout}")
+                logging.warning(f"[ASN {asn}] Error: {errout}")
 
             # Parse traceroute output
             filtered = [line for line in output if "*" not in line and line.strip()]
@@ -135,10 +147,10 @@ async def run_traceroute(ip, asn_data, prefix, results, longest):
 
             # Verify if the last hop matches the target IP
             if last_hop_ip != ip:
-                print(f"[ASN {asn}] Last hop ({last_hop_ip}) does not match target IP ({ip}). Ignoring result.")
+                logging.warning(f"[ASN {asn}] Last hop ({last_hop_ip}) does not match target IP ({ip}). Ignoring result.")
                 return
 
-            print(f"[ASN {asn}] {ip} - {hop_count} hops")
+            logging.info(f"[ASN {asn}] {ip} - {hop_count} hops")
 
             # Separate list for successful hops
             successful_hops = [line for line in output if line.split()[1] == ip]
@@ -157,15 +169,14 @@ async def run_traceroute(ip, asn_data, prefix, results, longest):
             # Update longest route found so far
             if hop_count > longest['hops']:
                 longest.update(entry)
-                print(f"\n📈 New longest route ({hop_count} hops) to {ip} (ASN {asn})\n")
-                # print("\n".join(output))
-                print("\n".join(successful_hops))
+                logging.info(f"\n📈 New longest route ({hop_count} hops) to {ip} (ASN {asn})\n")
+                logging.info("\n".join(successful_hops))
 
         except asyncio.TimeoutError:
             proc.kill()
-            print(f"[ASN {asn}] Traceroute to {ip} timed out")
+            logging.warning(f"[ASN {asn}] Traceroute to {ip} timed out")
     except Exception as e:
-        print(f"[ASN {asn}] Traceroute failed: {e}")
+        logging.error(f"[ASN {asn}] Traceroute failed: {e}")
 
 async def handle_asn(asn_data, results, longest):
     """
@@ -173,7 +184,6 @@ async def handle_asn(asn_data, results, longest):
     1. Finds live IPs in the ASN's prefixes.
     2. Runs traceroute for each live IP.
     """
-    # print("handle asns 1")
     for prefix in asn_data['prefixes']:
         # Find live IPs for the current prefix
         live_ips = await find_live_ip(prefix)
@@ -205,12 +215,12 @@ def save_results(results, longest, last_asn):
     # Save traceroute results
     with open(traceroutes_filename, "w") as f:
         json.dump(results, f, indent=4)
-    print(f"Traceroute results saved to {traceroutes_filename}")
+    logging.info(f"Traceroute results saved to {traceroutes_filename}")
 
     # Save the longest route
     with open(longest_route_filename, "w") as f:
         json.dump(longest, f, indent=4)
-    print(f"Longest route saved to {longest_route_filename}")
+    logging.info(f"Longest route saved to {longest_route_filename}")
 
 async def main():
     start_asn, n = 0, 1000000
@@ -218,15 +228,15 @@ async def main():
         n = int(sys.argv[1])
     if len(sys.argv) == 3:
         start_asn = int(sys.argv[2])  # Take the first argument as the starting ASN
-    print(f"Starting from ASN: {start_asn}, number asns to scan: {n}")
+    logging.info(f"Starting from ASN: {start_asn}, number asns to scan: {n}")
 
     # Check if the ASN-to-prefixes mapping file exists
     if os.path.exists(ASN_PREFIXES_FILE):
-        print(f"Loading ASN-to-prefixes mapping from {ASN_PREFIXES_FILE}")
+        logging.info(f"Loading ASN-to-prefixes mapping from {ASN_PREFIXES_FILE}")
         with open(ASN_PREFIXES_FILE, "r") as f:
             asns = json.load(f)
     else:
-        print("Generating ASN-to-prefixes mapping...")
+        logging.info("Generating ASN-to-prefixes mapping...")
         asns = load_smallest_asns(100000)  # Generate the mapping and save it to a file
         with open(ASN_PREFIXES_FILE, "w") as f:
             json.dump(asns, f, indent=2)
@@ -237,16 +247,16 @@ async def main():
     asns = asns[max(0, start_index-1):start_index + n]
 
     # Initialize the scan using the loaded or generated mapping
-    pprint(asns[:10])
+    logging.info(f"First 10 ASNs to process: {asns[:10]}")
     if len(asns) == 0:
-        print("No ASNs found. Exiting.")
+        logging.warning("No ASNs found. Exiting.")
         return
 
     results = []
     longest_result = {"hops": 0}
 
     # Create tasks for each ASN
-    print("creating tasks")
+    logging.info("Creating tasks")
     tasks = [handle_asn(asn_data, results, longest_result) for asn_data in asns]
 
     # Run all tasks concurrently
@@ -256,9 +266,8 @@ async def main():
     # Save all traceroute results
     save_results(results, longest_result, last_asn)
 
-    print(f"\n✅ Saved {len(results)} traceroutes")
-    print(f"📌 Longest route: {longest_result['hops']} hops to {longest_result['ip']}")
-
+    logging.info(f"\n✅ Saved {len(results)} traceroutes")
+    logging.info(f"📌 Longest route: {longest_result['hops']} hops to {longest_result['ip']}")
 
 if __name__ == "__main__":
     asyncio.run(main())
