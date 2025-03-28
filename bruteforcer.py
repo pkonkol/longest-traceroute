@@ -3,6 +3,10 @@ import subprocess
 import json
 import random
 import ipaddress
+import os
+from pprint import pprint
+from datetime import datetime
+import sys
 
 MAX_CONCURRENT = 300
 PING_RETRIES = 50
@@ -10,6 +14,8 @@ TRACEROUTE_TIMEOUT = 120
 ASRANK_FILE = "asns.jsonl"
 TRACEROUTE_CMD = 'gtraceroute'
 PING_CMD = 'gping'
+ASN_PREFIXES_FILE = "asn_prefixes.json"
+OUTPUT_DIR = "outputs"
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
@@ -53,21 +59,51 @@ def load_smallest_asns(n=10):
     return sorted(asns, key=lambda x: x['rank'], reverse=True)[:n]
 
 async def find_live_ip(prefix):
+    """
+    Finds a list of live IP addresses within the given prefix:
+    1. Always test the first usable IP.
+    2. Always test the last usable IP.
+    3. If neither is pingable, randomly test other IPs in the prefix.
+    Returns a list of pingable IPs.
+    """
     net = ipaddress.ip_network(prefix)
-    for _ in range(PING_RETRIES):
-        ip = str(random.choice(list(net.hosts())))
-        try:
-            res = await asyncio.create_subprocess_exec(
-                PING_CMD, '-c', '1', '-W', '1', ip,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            await res.wait()
-            if res.returncode == 0:
-                return ip
-        except:
-            continue
-    return None
+    live_ips = []
+
+    # Test the first usable IP
+    first_ip = str(next(net.hosts()))
+    if await is_pingable(first_ip):
+        live_ips.append(first_ip)
+
+    # Test the last usable IP
+    last_ip = str(list(net.hosts())[-1])
+    if await is_pingable(last_ip):
+        live_ips.append(last_ip)
+
+    # If no live IPs found yet, randomly test other IPs in the prefix
+    if not live_ips:
+        random_ips = random.sample(list(net.hosts()), min(100, net.num_addresses - 2))
+        for ip in random_ips:
+            if await is_pingable(str(ip)):
+                live_ips.append(str(ip))
+                break
+
+    # Return the list of live IPs
+    return live_ips
+
+async def is_pingable(ip):
+    """
+    Checks if an IP address is reachable using a single ping.
+    """
+    try:
+        res = await asyncio.create_subprocess_exec(
+            PING_CMD, '-c', '1', '-W', '1', ip,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        await res.wait()
+        return res.returncode == 0
+    except:
+        return False
 
 async def run_traceroute(ip, asn_data, prefix, results, longest):
     asn = asn_data['asn']
@@ -134,23 +170,77 @@ async def run_traceroute(ip, asn_data, prefix, results, longest):
 
 
 async def handle_asn(asn_data, results, longest):
+    """
+    Handles scanning for a given ASN:
+    1. Finds live IPs in the ASN's prefixes.
+    2. Runs traceroute for each live IP.
+    """
     for prefix in asn_data['prefixes']:
-        ip = await find_live_ip(prefix)
-        if ip:
-            async with semaphore:  # Acquire semaphore only for the traceroute operation
-                await run_traceroute(ip, asn_data, prefix, results, longest)
-            break
+        # Get a list of live IPs (first, last, and random usable IPs if pingable)
+        live_ips = await find_live_ip(prefix)
 
-import json
-from pprint import pprint
+        # Scan each live IP
+        for ip in live_ips:
+            async with semaphore:  # Limit concurrency
+                await run_traceroute(ip, asn_data, prefix, results, longest)
+
+def save_results(results, longest, last_asn):
+    """
+    Saves the traceroute results and the longest route to the outputs/ directory.
+    Filenames include a timestamp, the number of results, and the longest route quality.
+    """
+    # Ensure the outputs directory exists
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Generate a timestamp
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Get the number of results and the longest route quality
+    results_count = len(results)
+    longest_hops = longest.get("hops", 0)
+
+    # Generate filenames
+    traceroutes_filename = f"{OUTPUT_DIR}/traceroutes_{timestamp}_{results_count}results_{longest_hops}hops_{last_asn}last.json"
+    longest_route_filename = f"{OUTPUT_DIR}/longest_route_{timestamp}_{results_count}results_{longest_hops}hops_{last_asn}last.json"
+
+    # Save traceroute results
+    with open(traceroutes_filename, "w") as f:
+        json.dump(results, f, indent=4)
+    print(f"Traceroute results saved to {traceroutes_filename}")
+
+    # Save the longest route
+    with open(longest_route_filename, "w") as f:
+        json.dump(longest, f, indent=4)
+    print(f"Longest route saved to {longest_route_filename}")
 
 async def main():
-    asns = load_smallest_asns(1000)
-    pprint(asns)
+    start_asn, n = 0, 10
+    if len(sys.argv) > 2:
+        start_asn = int(sys.argv[1])  # Take the first argument as the starting ASN
+        n = int(sys.argv[2])
+        print(f"Starting from ASN: {start_asn}, number asns to scan: {n}")
+
+    # Check if the ASN-to-prefixes mapping file exists
+    if os.path.exists(ASN_PREFIXES_FILE):
+        print(f"Loading ASN-to-prefixes mapping from {ASN_PREFIXES_FILE}")
+        with open(ASN_PREFIXES_FILE, "r") as f:
+            asns = json.load(f)
+    else:
+        print("Generating ASN-to-prefixes mapping...")
+        asns = load_smallest_asns(100000)  # Generate the mapping and save it to a file
+        with open(ASN_PREFIXES_FILE, "w") as f:
+            huj = json.dump(asns, f, indent=2)
+
+    start_index = next((i for i, asn in enumerate(asns) if asn['asn'] == start_asn), None)
+    if start_index is None:
+        start_index = 0
+    asns = asns[start_index:start_index + n]
+
+    # Initialize the scan using the loaded or generated mapping
+    pprint(asns[:10])
     if len(asns) == 0:
         print("No ASNs found. Exiting.")
         return
-
 
     results = []
     longest_result = {"hops": 0}
@@ -158,13 +248,9 @@ async def main():
     tasks = [asyncio.create_task(handle_asn(asn, results, longest_result)) for asn in asns]
     await asyncio.gather(*tasks)
 
+    last_asn = asns[-1]['asn']
     # Save all traceroute results
-    with open("traceroutes.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-    # Save the longest route separately
-    with open("longest_route.json", "w") as f:
-        json.dump(longest_result, f, indent=2)
+    save_results(results, longest_result, last_asn)
 
     print(f"\n✅ Saved {len(results)} traceroutes")
     print(f"📌 Longest route: {longest_result['hops']} hops to {longest_result['ip']}")
